@@ -1,58 +1,60 @@
-#!/usr/bin/env node
-
+require("dotenv").config();
 const express = require("express");
-const { Command } = require("commander");
-const fs = require("fs");
-const path = require("path");
 const multer = require("multer");
+const path = require("path");
 const swaggerUi = require("swagger-ui-express");
 const swaggerJsdoc = require("swagger-jsdoc");
+const mysql = require("mysql2/promise");
+const fs = require("fs");
 
-const program = new Command();
+// ==========================
+// MySQL підключення
+// ==========================
+let db;
 
-program
-  .requiredOption("-h, --host <host>", "Server host address")
-  .requiredOption("-p, --port <port>", "Server port", parseInt)
-  .requiredOption("-c, --cache <dir>", "Cache directory")
-  .parse(process.argv);
+async function initDB() {
+  db = await mysql.createPool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT || 3306,
+  });
 
-const { host, port, cache } = program.opts();
-
-if (!fs.existsSync(cache)) {
-  fs.mkdirSync(cache, { recursive: true });
+  console.log("✅ MySQL connected!");
 }
 
-const DB_FILE = path.join(cache, "inventory.json");
-if (!fs.existsSync(DB_FILE)) fs.writeFileSync(DB_FILE, "[]", "utf8");
+initDB().catch(err => {
+  console.error("❌ Database connection failed:", err);
+  process.exit(1);
+});
 
-function loadDB() {
-  return JSON.parse(fs.readFileSync(DB_FILE, "utf8"));
-}
 
-function saveDB(data) {
-  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2));
-}
-
+// ==========================
+// Express + Multer
+// ==========================
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Multer config
+// Папка з фото (в контейнері /app/photos)
+const PHOTOS_DIR = path.join(__dirname, "photos");
+if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+
 const upload = multer({
-  dest: path.join(cache, "photos")
+  dest: PHOTOS_DIR
 });
 
-if (!fs.existsSync(path.join(cache, "photos")))
-  fs.mkdirSync(path.join(cache, "photos"), { recursive: true });
-
-// Swagger setup
+// ==========================
+// Swagger
+// ==========================
 const swaggerSpec = swaggerJsdoc({
   definition: {
     openapi: "3.0.0",
     info: {
       title: "Inventory Service API",
       version: "1.0.0",
-      description: "Web API for inventory management system"
+      description: "Web API for inventory management (Lab 7, Docker + DB)"
     }
   },
   apis: ["./index.js"]
@@ -61,351 +63,151 @@ const swaggerSpec = swaggerJsdoc({
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
 
-// ========================================================
-// POST /register
-// ========================================================
-/**
- * @openapi
- * /register:
- *   post:
- *     summary: Register a new inventory item
- *     description: Creates new item with name, description and optional photo.
- *     tags:
- *       - Inventory
- *     requestBody:
- *       required: true
- *       content:
- *         multipart/form-data:
- *           schema:
- *             type: object
- *             properties:
- *               inventory_name:
- *                 type: string
- *                 description: Name of item
- *               description:
- *                 type: string
- *               photo:
- *                 type: string
- *                 format: binary
- *     responses:
- *       201:
- *         description: Successfully created
- *       400:
- *         description: Missing inventory_name
- */
-app.post("/register", upload.single("photo"), (req, res) => {
+// ========================================================================
+// POST /register — CREATE
+// ========================================================================
+app.post("/register", upload.single("photo"), async (req, res) => {
+  try {
+    const { inventory_name, description } = req.body;
+
+    if (!inventory_name) {
+      return res.status(400).json({ error: "inventory_name is required" });
+    }
+
+    const [result] = await db.query(
+      "INSERT INTO inventory (inventory_name, description, photo) VALUES (?,?,?)",
+      [inventory_name, description || "", req.file ? req.file.filename : null]
+    );
+
+    const inserted = {
+      id: result.insertId,
+      inventory_name,
+      description,
+      photo: req.file ? req.file.filename : null
+    };
+
+    res.status(201).json(inserted);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "DB error" });
+  }
+});
+
+
+// ========================================================================
+// GET /inventory — READ ALL
+// ========================================================================
+app.get("/inventory", async (req, res) => {
+  const [rows] = await db.query("SELECT * FROM inventory");
+  res.json(rows);
+});
+
+
+// ========================================================================
+// GET /inventory/:id — READ ONE
+// ========================================================================
+app.get("/inventory/:id", async (req, res) => {
+  const [rows] = await db.query("SELECT * FROM inventory WHERE id = ?", [
+    req.params.id,
+  ]);
+
+  if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+
+  res.json(rows[0]);
+});
+
+
+// ========================================================================
+// PUT /inventory/:id — UPDATE
+// ========================================================================
+app.put("/inventory/:id", async (req, res) => {
   const { inventory_name, description } = req.body;
 
-  if (!inventory_name || inventory_name.trim() === "") {
-    return res.status(400).json({ error: "inventory_name is required" });
-  }
+  const [rows] = await db.query("SELECT * FROM inventory WHERE id = ?", [
+    req.params.id,
+  ]);
 
-  const db = loadDB();
+  if (rows.length === 0) return res.status(404).json({ error: "Not found" });
 
-  const newItem = {
-    id: Date.now().toString(),
-    inventory_name,
-    description: description || "",
-    photo: req.file ? req.file.filename : null
-  };
+  await db.query(
+    "UPDATE inventory SET inventory_name = ?, description = ? WHERE id = ?",
+    [inventory_name || rows[0].inventory_name,
+     description || rows[0].description,
+     req.params.id]
+  );
 
-  db.push(newItem);
-  saveDB(db);
-
-  res.status(201).json(newItem);
+  res.json({ message: "Updated" });
 });
 
 
-// ========================================================
-// GET /inventory
-// ========================================================
-/**
- * @openapi
- * /inventory:
- *   get:
- *     summary: Get all inventory items
- *     tags:
- *       - Inventory
- *     responses:
- *       200:
- *         description: Inventory list returned
- */
-app.get("/inventory", (req, res) => {
-  const db = loadDB();
-  res.json(db);
-});
+// ========================================================================
+// GET /inventory/:id/photo — READ PHOTO
+// ========================================================================
+app.get("/inventory/:id/photo", async (req, res) => {
+  const [rows] = await db.query("SELECT photo FROM inventory WHERE id = ?", [
+    req.params.id,
+  ]);
 
-
-// ========================================================
-// GET /inventory/:id
-// ========================================================
-/**
- * @openapi
- * /inventory/{id}:
- *   get:
- *     summary: Get inventory item by ID
- *     tags:
- *       - Inventory
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     responses:
- *       200:
- *         description: Item found
- *       404:
- *         description: Not found
- */
-app.get("/inventory/:id", (req, res) => {
-  const db = loadDB();
-  const item = db.find(x => x.id === req.params.id);
-
-  if (!item) return res.status(404).json({ error: "Not found" });
-
-  res.json(item);
-});
-
-
-// ========================================================
-// PUT /inventory/:id
-// ========================================================
-/**
- * @openapi
- * /inventory/{id}:
- *   put:
- *     summary: Update inventory item
- *     tags:
- *       - Inventory
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: string
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             properties:
- *               inventory_name:
- *                 type: string
- *               description:
- *                 type: string
- *     responses:
- *       200:
- *         description: Updated
- *       404:
- *         description: Not found
- */
-app.put("/inventory/:id", (req, res) => {
-  const db = loadDB();
-  const idx = db.findIndex(x => x.id === req.params.id);
-
-  if (idx === -1) {
-    return res.status(404).json({ error: "Not found" });
-  }
-
-  const { inventory_name, description } = req.body;
-
-  // nothing sent in body
-  if (!inventory_name && !description) {
-    return res.status(400).json({ error: "No fields provided for update" });
-  }
-
-  if (inventory_name !== undefined) {
-    db[idx].inventory_name = inventory_name;
-  }
-
-  if (description !== undefined) {
-    db[idx].description = description;
-  }
-
-  saveDB(db);
-
-  res.json(db[idx]);
-});
-
-
-
-// ========================================================
-// GET /inventory/:id/photo
-// ========================================================
-/**
- * @openapi
- * /inventory/{id}/photo:
- *   get:
- *     summary: Get photo of an item
- *     tags:
- *       - Inventory
- *     parameters:
- *       - in: path
- *         name: id
- *         schema:
- *           type: string
- *         required: true
- *     responses:
- *       200:
- *         description: Photo returned
- *       404:
- *         description: Not found
- */
-app.get("/inventory/:id/photo", (req, res) => {
-  const db = loadDB();
-  const item = db.find(x => x.id === req.params.id);
-
-  if (!item || !item.photo) return res.status(404).send("Not found");
-
-  const photoPath = path.join(cache, "photos", item.photo);
-
-  if (!fs.existsSync(photoPath))
+  if (rows.length === 0 || !rows[0].photo)
     return res.status(404).send("Photo not found");
 
-  res.setHeader("Content-Type", "image/jpeg");
-  fs.createReadStream(photoPath).pipe(res);
+  const filePath = path.join(PHOTOS_DIR, rows[0].photo);
+
+  if (!fs.existsSync(filePath))
+    return res.status(404).send("File missing");
+
+  res.sendFile(filePath);
 });
 
 
-// ========================================================
-// PUT /inventory/:id/photo
-// ========================================================
-/**
- * @openapi
- * /inventory/{id}/photo:
- *   put:
- *     summary: Update photo of an item
- *     tags:
- *       - Inventory
- *     parameters:
- *       - in: path
- *         name: id
- *         schema:
- *           type: string
- *         required: true
- *     requestBody:
- *       content:
- *         multipart/form-data:
- *           schema:
- *             type: object
- *             properties:
- *               photo:
- *                 type: string
- *                 format: binary
- *     responses:
- *       200:
- *         description: Photo updated
- *       400:
- *         description: Missing file
- *       404:
- *         description: Item not found
- */
-app.put("/inventory/:id/photo", upload.single("photo"), (req, res) => {
-  const db = loadDB();
-  const idx = db.findIndex(x => x.id === req.params.id);
+// ========================================================================
+// PUT /inventory/:id/photo — UPDATE PHOTO
+// ========================================================================
+app.put("/inventory/:id/photo", upload.single("photo"), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "Missing file" });
 
-  if (idx === -1) return res.status(404).json({ error: "Not found" });
-  if (!req.file) return res.status(400).json({ error: "Photo missing" });
+  const [rows] = await db.query("SELECT * FROM inventory WHERE id = ?", [
+    req.params.id,
+  ]);
 
-  db[idx].photo = req.file.filename;
-  saveDB(db);
+  if (rows.length === 0) return res.status(404).json({ error: "Not found" });
+
+  await db.query("UPDATE inventory SET photo = ? WHERE id = ?", [
+    req.file.filename,
+    req.params.id,
+  ]);
 
   res.json({ message: "Photo updated" });
 });
 
 
-// ========================================================
-// POST /search
-// ========================================================
-/**
- * @openapi
- * /search:
- *   post:
- *     summary: Search for an item by ID
- *     description: Search form using x-www-form-urlencoded
- *     tags:
- *       - Inventory
- *     requestBody:
- *       required: true
- *       content:
- *         application/x-www-form-urlencoded:
- *           schema:
- *             type: object
- *             properties:
- *               id:
- *                 type: string
- *               includePhoto:
- *                 type: string
- *     responses:
- *       200:
- *         description: Item found
- *       404:
- *         description: Not found
- */
-app.post("/search", (req, res) => {
-  const { id, includePhoto } = req.body;
+// ========================================================================
+// DELETE
+// ========================================================================
+app.delete("/inventory/:id", async (req, res) => {
+  const [rows] = await db.query("SELECT * FROM inventory WHERE id = ?", [
+    req.params.id,
+  ]);
 
-  const db = loadDB();
-  const item = db.find(x => x.id === id);
+  if (rows.length === 0) return res.status(404).json({ error: "Not found" });
 
-  if (!item) return res.status(404).send("Not found");
+  await db.query("DELETE FROM inventory WHERE id = ?", [req.params.id]);
 
-  if (includePhoto) {
-    item.description += `\nPhoto: /inventory/${id}/photo`;
-  }
-
-  res.json(item);
+  res.json({ message: "Deleted" });
 });
 
 
-// ========================================================
-// DELETE /inventory/:id
-// ========================================================
-/**
- * @openapi
- * /inventory/{id}:
- *   delete:
- *     summary: Delete an inventory item
- *     tags:
- *       - Inventory
- *     parameters:
- *       - in: path
- *         name: id
- *         schema:
- *           type: string
- *         required: true
- *     responses:
- *       200:
- *         description: Deleted
- *       404:
- *         description: Not found
- */
-app.delete("/inventory/:id", (req, res) => {
-  const db = loadDB();
-  const id = req.params.id;
-
-  const idx = db.findIndex(x => String(x.id) === String(id));
-
-  if (idx === -1) {
-    return res.status(404).json({ error: `Item with id ${id} not found` });
-  }
-
-  db.splice(idx, 1);
-  saveDB(db);
-
-  res.json({ message: `Item with id ${id} deleted` });
-});
-
-
-// ========================================================
+// ========================================================================
 app.use((req, res) => {
   res.status(405).send("Method not allowed");
 });
 
 
-// ========================================================
-app.listen(port, host, () => {
-  console.log(`Server running at http://${host}:${port}`);
+// ========================================================================
+// START SERVER
+// ========================================================================
+const PORT = process.env.APP_PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
 });
